@@ -40,7 +40,7 @@ struct naive_trie {
         if (res != children.end()) {
             res->second.insert(key + 1, len - 1, value);
         } else {
-            auto res = children.insert(std::make_pair(c, naive_trie()));
+            auto res = children.emplace(c, naive_trie());
             res.first->second.insert(key + 1, len - 1, value);
         }
     }
@@ -62,9 +62,9 @@ struct naive_trie {
             return &res->second;
         }
 
-        return NULL;
+        return nullptr;
     }
-    std::map<char, struct naive_trie> children;
+    std::unordered_map<char, struct naive_trie> children;
     bool has_value;
     llama_token value;
 };
@@ -117,6 +117,8 @@ struct llm_tokenizer_spm_session {
 
     void tokenize(const std::string & text, std::vector<llama_token> & output) {
         // split string into utf8 chars
+        symbols.clear();
+        symbols.reserve(text.size());
         int index = 0;
         size_t offs = 0;
         while (offs < text.size()) {
@@ -204,8 +206,8 @@ private:
         if (left == -1 || right == -1) {
             return;
         }
-        const std::string text = std::string(symbols[left].text, symbols[left].n + symbols[right].n);
-        auto token = vocab.text_to_token(text);
+        std::string_view text_view(symbols[left].text, symbols[left].n + symbols[right].n);
+        auto token = vocab.text_to_token(text_view);
 
         if (token == LLAMA_TOKEN_NULL) {
             return;
@@ -221,12 +223,12 @@ private:
         bigram.left  = left;
         bigram.right = right;
         bigram.score = tok_data.score;
-        bigram.size  = text.size();
+        bigram.size  = text_view.size();
 
         work_queue.push(bigram);
 
         // Do we need to support is_unused?
-        rev_merge[text] = std::make_pair(left, right);
+        rev_merge[std::string(text_view)] = std::make_pair(left, right);
     }
 
     const llama_vocab & vocab;
@@ -235,7 +237,7 @@ private:
 
     std::vector<llm_symbol> symbols;
     llm_bigram_spm::queue work_queue;
-    std::map<std::string, std::pair<int, int>> rev_merge;
+    std::unordered_map<std::string, std::pair<int, int>> rev_merge;
 };
 
 //
@@ -778,26 +780,24 @@ private:
         if (left == -1 || right == -1) {
             return;
         }
-        std::string left_token  = std::string(symbols[left].text,  symbols[left].n);
-        std::string right_token = std::string(symbols[right].text, symbols[right].n);
+        std::string_view left_view (symbols[left].text,  symbols[left].n);
+        std::string_view right_view(symbols[right].text, symbols[right].n);
 
-        int rank_found = -1;
-
-        rank_found = vocab.find_bpe_rank(left_token, right_token);
-
+        const int rank_found = vocab.find_bpe_rank(left_view, right_view);
         if (rank_found < 0) {
             return;
         }
 
         llm_bigram_bpe bigram;
-
         bigram.left  = left;
         bigram.right = right;
-        bigram.text  = left_token + right_token;
-        bigram.size  = left_token.size() + right_token.size();
+        bigram.text.reserve(left_view.size() + right_view.size());
+        bigram.text.append(left_view);
+        bigram.text.append(right_view);
+        bigram.size  = bigram.text.size();
         bigram.rank  = rank_found;
 
-        work_queue.push(bigram);
+        work_queue.push(std::move(bigram));
     }
 
     const llama_vocab & vocab;
@@ -2090,18 +2090,32 @@ struct llama_vocab::impl {
     // Tokenizer normalizer options
     llama_vocab::normalizer_options normalizer_opts;
 
-    std::unordered_map<std::string, llama_token> token_to_id;
+    struct string_hash {
+        using is_transparent = void;
+        size_t operator()(std::string_view sv) const noexcept { return std::hash<std::string_view>{}(sv); }
+        size_t operator()(const std::string & s) const noexcept { return std::hash<std::string_view>{}(std::string_view(s)); }
+    };
+    std::unordered_map<std::string, llama_token, string_hash, std::equal_to<>> token_to_id;
     std::vector<token_data>                      id_to_token;
 
     std::vector<llama_token> cache_special_tokens;
     std::vector<std::string> cache_token_to_piece; // llama_token_to_piece(special = true);
     struct pair_hash {
-        size_t operator()(const std::pair<std::string, std::string> & p) const {
-            return std::hash<std::string>{}(p.first) ^  //create some hash for pair
-                   (std::hash<std::string>{}(p.second) << 1);
+        using is_transparent = void;
+        size_t operator()(const std::pair<std::string, std::string> & p) const noexcept {
+            return std::hash<std::string>{}(p.first) ^ (std::hash<std::string>{}(p.second) << 1);
+        }
+        size_t operator()(const std::pair<std::string_view, std::string_view> & p) const noexcept {
+            return std::hash<std::string_view>{}(p.first) ^ (std::hash<std::string_view>{}(p.second) << 1);
         }
     };
-    std::unordered_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
+    struct pair_eq {
+        using is_transparent = void;
+        bool operator()(const std::pair<std::string, std::string> & a, const std::pair<std::string, std::string> & b) const noexcept { return a == b; }
+        bool operator()(const std::pair<std::string_view, std::string_view> & a, const std::pair<std::string, std::string> & b) const noexcept { return a.first == b.first && a.second == b.second; }
+        bool operator()(const std::pair<std::string, std::string> & a, const std::pair<std::string_view, std::string_view> & b) const noexcept { return a.first == b.first && a.second == b.second; }
+    };
+    std::unordered_map<std::pair<std::string, std::string>, int, pair_hash, pair_eq> bpe_ranks;
 
     // set of all tokens that cause "end of generation"
     std::set<llama_token> special_eog_ids;
@@ -4329,11 +4343,15 @@ llama_token llama_vocab::byte_to_token(uint8_t ch) const {
     }
 }
 
-llama_token llama_vocab::text_to_token(const std::string & text) const {
+llama_token llama_vocab::text_to_token(std::string_view text) const {
     GGML_ASSERT(pimpl->type != LLAMA_VOCAB_TYPE_NONE);
-    auto it = pimpl->token_to_id.find(text);
-    if (it != pimpl->token_to_id.end()) {
-        return (*it).second;
+    auto & map = pimpl->token_to_id;
+    if (map.empty()) return LLAMA_TOKEN_NULL;
+    typename llama_vocab::impl::string_hash hasher;
+    size_t h = hasher(text);
+    size_t b = map.bucket_count() ? (h % map.bucket_count()) : 0;
+    for (auto it = map.begin(b); it != map.end(b); ++it) {
+        if (it->first == text) return it->second;
     }
     return LLAMA_TOKEN_NULL;
 }
@@ -4481,16 +4499,18 @@ int llama_vocab::max_token_len() const {
     return pimpl->max_token_len;
 }
 
-int llama_vocab::find_bpe_rank(const std::string & token_left, const std::string & token_right) const {
-    GGML_ASSERT(token_left.find(' ')   == std::string::npos);
-    GGML_ASSERT(token_right.find(' ')  == std::string::npos);
-
-    auto it = pimpl->bpe_ranks.find(std::make_pair(token_left, token_right));
-    if (it == pimpl->bpe_ranks.end()) {
-        return -1;
+int llama_vocab::find_bpe_rank(std::string_view token_left, std::string_view token_right) const {
+    auto & map = pimpl->bpe_ranks;
+    if (map.empty()) return -1;
+    typename llama_vocab::impl::pair_hash hasher;
+    size_t h = hasher(std::pair<std::string_view, std::string_view>{token_left, token_right});
+    size_t b = map.bucket_count() ? (h % map.bucket_count()) : 0;
+    for (auto it = map.begin(b); it != map.end(b); ++it) {
+        if (it->first.first == token_left && it->first.second == token_right) {
+            return it->second;
+        }
     }
-
-    return it->second;
+    return -1;
 }
 
 std::vector<std::string> llama_vocab::get_bpe_merges() const {

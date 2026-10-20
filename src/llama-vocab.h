@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <memory>
 
@@ -116,7 +117,7 @@ struct llama_vocab {
     uint8_t     token_to_byte(llama_token id) const;
     llama_token byte_to_token(uint8_t ch)     const;
 
-    llama_token text_to_token(const std::string & text) const;
+    llama_token text_to_token(std::string_view text) const;
 
     const token_data & get_token_data(llama_token id) const;
 
@@ -161,7 +162,7 @@ struct llama_vocab {
 
     int max_token_len() const;
 
-    int find_bpe_rank(const std::string & token_left, const std::string & token_right) const;
+    int find_bpe_rank(std::string_view token_left, std::string_view token_right) const;
     std::vector<std::string> get_bpe_merges() const;
 
     std::vector<char> get_precompiled_charsmap() const;

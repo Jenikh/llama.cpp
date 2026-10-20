@@ -59,13 +59,12 @@ struct ring_buffer {
         }
 
         if (sz == capacity) {
-            // advance the start when buffer is full
-            first = (first + 1) % capacity;
+            if (++first == capacity) first = 0;
         } else {
-            sz++;
+            ++sz;
         }
         data[pos] = value;
-        pos = (pos + 1) % capacity;
+        if (++pos == capacity) pos = 0;
     }
 
     T pop_front() {
@@ -73,8 +72,8 @@ struct ring_buffer {
             throw std::runtime_error("ring buffer is empty");
         }
         T value = data[first];
-        first = (first + 1) % capacity;
-        sz--;
+        if (++first == capacity) first = 0;
+        --sz;
         return value;
     }
 
@@ -96,14 +95,18 @@ struct ring_buffer {
         if (i >= sz) {
             throw std::runtime_error("ring buffer: index out of bounds");
         }
-        return data[(first + sz - i - 1) % capacity];
+        size_t idx = first + sz - i - 1;
+        if (idx >= capacity) idx -= capacity;
+        return data[idx];
     }
 
     std::vector<T> to_vector() const {
         std::vector<T> result;
         result.reserve(sz);
         for (size_t i = 0; i < sz; i++) {
-            result.push_back(data[(first + i) % capacity]);
+            size_t idx = first + i;
+            if (idx >= capacity) idx -= capacity;
+            result.push_back(data[idx]);
         }
         return result;
     }
@@ -143,18 +146,14 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
     constexpr float bucket_scale = nbuckets/(bucket_high - bucket_low);
     constexpr float bucket_inter = -bucket_low * bucket_scale;
 
-    std::vector<int> bucket_idx;
-    std::vector<int> histo(nbuckets, 0);
+    // stack histo - avoid heap allocation
+    int histo[nbuckets] = {0};
 
-    std::vector<llama_token_data*> bucket_ptrs;
-
-    bucket_idx.reserve(cur.size);
-
+    // first pass: histogram, no per-element storage
     for (int i = 0; i < (int)cur.size; ++i) {
         const float val = cur.data[i].logit;
-        int ib = int(bucket_scale * val + bucket_inter); //nbuckets * (val - bucket_low) / (bucket_high - bucket_low);
+        int ib = int(bucket_scale * val + bucket_inter);
         ib = std::max(0, std::min(nbuckets - 1, ib));
-        bucket_idx.push_back(ib);
         ++histo[ib];
     }
     int nhave = 0;
@@ -166,16 +165,21 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
         }
     }
     res.resize(nhave);
-    auto * ptr = res.data();
-    bucket_ptrs.reserve(nbuckets - ib);
+
+    // build bucket pointers as stack array
+    llama_token_data * bucket_next[nbuckets] = {nullptr};
+    llama_token_data * ptr = res.data();
     for (int j = nbuckets - 1; j >= ib; --j) {
-        bucket_ptrs.push_back(ptr);
+        bucket_next[j] = ptr;
         ptr += histo[j];
     }
+    // second pass: scatter - recompute bucket index instead of storing it
     for (int i = 0; i < (int)cur.size; ++i) {
-        int j = bucket_idx[i];
+        const float val = cur.data[i].logit;
+        int j = int(bucket_scale * val + bucket_inter);
+        j = std::max(0, std::min(nbuckets - 1, j));
         if (j >= ib) {
-            *bucket_ptrs[nbuckets - 1 - j]++ = cur.data[i];
+            *bucket_next[j]++ = cur.data[i];
         }
     }
 
@@ -2868,8 +2872,9 @@ struct llama_sampler_penalties : public llama_sampler_backend {
 
     ring_buffer<llama_token> prev;
 
-    // a frequency map to count token occurrences
-    std::unordered_map<llama_token, int> token_count;
+    // fast frequency table: O(1) lookup vs hash map
+    std::vector<int> counts; // size n_vocab, 0 = not present
+    std::vector<llama_token> active; // distinct tokens with counts>0
 
     // backend graph inputs
     ggml_tensor * inp_token_ids = nullptr;
@@ -2882,10 +2887,29 @@ struct llama_sampler_penalties : public llama_sampler_backend {
     std::vector<int32_t> host_token_ids;
     std::vector<int32_t> host_counts;
 
+    void inc_token(llama_token tok) {
+        if (tok < 0 || tok >= n_vocab) return;
+        if (counts[tok] == 0) active.push_back(tok);
+        ++counts[tok];
+    }
+    void dec_token(llama_token tok) {
+        if (tok < 0 || tok >= n_vocab) return;
+        if (--counts[tok] == 0) {
+            for (size_t i = 0; i < active.size(); ++i) {
+                if (active[i] == tok) {
+                    active[i] = active.back();
+                    active.pop_back();
+                    break;
+                }
+            }
+        }
+    }
+
     void copy_state(const llama_sampler_penalties & src) {
         // note: inp_token_ids/inp_counts belong to the current sampling graph
-        prev        = src.prev;
-        token_count = src.token_count;
+        prev   = src.prev;
+        counts = src.counts;
+        active = src.active;
     }
 
     static bool is_disabled(
@@ -2913,7 +2937,8 @@ struct llama_sampler_penalties : public llama_sampler_backend {
         , penalty_repeat  (penalty_repeat)
         , penalty_freq    (penalty_freq)
         , penalty_present (penalty_present)
-        , prev            (penalty_last_n) {
+        , prev            (penalty_last_n)
+        , counts          (n_vocab > 0 ? n_vocab : 0, 0) {
     }
 };
 
@@ -2928,29 +2953,15 @@ static void llama_sampler_penalties_accept(struct llama_sampler * smpl, llama_to
         return;
     }
 
-    ctx->token_count[token]++;
+    ctx->inc_token(token);
 
     // if the ring buffer is full, remove the oldest token
     if (ctx->prev.size() >= (size_t) ctx->penalty_last_n) {
         const auto old = ctx->prev.front();
-
-        ctx->token_count[old]--;
-        if (ctx->token_count[old] == 0) {
-            ctx->token_count.erase(old);
-        }
+        ctx->dec_token(old);
     }
 
     ctx->prev.push_back(token);
-
-#if 0
-    // sanity check
-    std::unordered_map<llama_token, int> tmp;
-    for (int i = 0; i < std::min<int>(ctx->penalty_last_n, ctx->prev.size()); ++i) {
-        tmp[ctx->prev.rat(i)]++;
-    }
-
-    assert(ctx->token_count == tmp);
-#endif
 }
 
 static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
@@ -2960,14 +2971,12 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
-    // Apply frequency and presence penalties to the cur_p
+    // Apply frequency and presence penalties to the cur_p - O(1) array lookup vs hash map
     for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
+        const llama_token id = cur_p->data[i].id;
+        if (id < 0 || id >= ctx->n_vocab) continue;
+        const int count = ctx->counts[id];
+        if (count == 0) continue;
 
         assert(count > 0 && count <= ctx->penalty_last_n);
 
@@ -2988,7 +2997,8 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
 static void llama_sampler_penalties_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_penalties *) smpl->ctx;
     ctx->prev.clear();
-    ctx->token_count.clear();
+    for (auto tok : ctx->active) ctx->counts[tok] = 0;
+    ctx->active.clear();
 }
 
 static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_sampler * smpl) {
@@ -3004,8 +3014,9 @@ static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_s
     {
         auto * result_ctx = (llama_sampler_penalties *) result->ctx;
 
-        result_ctx->prev        = ctx->prev;
-        result_ctx->token_count = ctx->token_count;
+        result_ctx->prev   = ctx->prev;
+        result_ctx->counts = ctx->counts;
+        result_ctx->active = ctx->active;
     }
 
     return result;
@@ -3137,14 +3148,13 @@ static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smp
         return;
     }
 
-    // fill active entries from the map
-    int32_t n_active = 0;
-
-    for (const auto & it : sctx->token_count) {
-        GGML_ASSERT(n_active < sctx->n_max);
-        sctx->host_token_ids[n_active] = it.first;
-        sctx->host_counts   [n_active] = it.second;
-        ++n_active;
+    // fill active entries from the vector table
+    int32_t n_active = (int32_t) sctx->active.size();
+    GGML_ASSERT(n_active <= sctx->n_max);
+    for (int32_t i = 0; i < n_active; ++i) {
+        const llama_token tok = sctx->active[i];
+        sctx->host_token_ids[i] = tok;
+        sctx->host_counts   [i] = sctx->counts[tok];
     }
 
     // Sorting is required because backend_apply uses ggml_set_rows (a scatter-back operation)
@@ -3161,12 +3171,10 @@ static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smp
         sctx->host_counts   [i] = entries[i].second;
     }
 
-    // Padding: Finds a filler token id that is not present in token_count.
-    // Use it to do padding for the arrays, it avoids resizing every time.
-    // The arrays must always have exactly n_max entries (the GPU tensor is a fixed size).
+    // Padding: Finds a filler token id that is not present
     int32_t filler = 0;
     if (n_active < sctx->n_max) {
-        while (sctx->token_count.find(filler) != sctx->token_count.end()) {
+        while (filler < sctx->n_vocab && sctx->counts[filler] != 0) {
             ++filler;
         }
         GGML_ASSERT(filler < sctx->n_vocab);
@@ -3266,10 +3274,11 @@ static void llama_sampler_top_n_sigma_apply(struct llama_sampler * smpl, llama_t
     for (size_t i = 0; i < cur_p->size; ++i) {
         // Skip -infinity in std calculation
         if (cur_p->data[i].logit != -INFINITY) {
-            acc += pow(cur_p->data[i].logit - mean, 2);
+            const float diff = cur_p->data[i].logit - mean;
+            acc += diff*diff;
         }
     }
-    float std = valid_count > 0 ? sqrt(acc/valid_count) : 0;
+    float std = valid_count > 0 ? sqrtf(acc/valid_count) : 0;
 
     // apply mask
     for (size_t i = 0; i < cur_p->size; ++i) {
